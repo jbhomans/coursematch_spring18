@@ -1,0 +1,412 @@
+---
+title: "CourseMatch Analytics - Spring 2019"
+subtitle: "Data Processing for Google Sheet"
+date: "`r format(Sys.time(), '%Y-%m-%d')`"
+output:
+  bookdown::html_document2:
+    #css: css/analysis.css
+    code_folding: show
+    df_print: paged
+    number_sections: yes
+    self-contained: true
+    fig_caption: yes
+    toc: true
+    toc_float: true
+params:
+  external_queries: false
+---
+
+```{r setup, include = TRUE}
+#setwd("<insert path>")
+
+# knitr options
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE, fig.align = 'center',
+                      fig.width = 9, fig.height = 8, cache = FALSE)
+
+# Forces any incline R to only have 2 digits and a comma for the thounsands place
+knitr::knit_hooks$set(inline = function(x) {if(!is.numeric(x)){ x }else{ prettyNum(round(x,2), big.mark=",") } })
+
+# Don't show scientific notation and only 3 digits
+options(scipen = 999, digits = 3)
+
+# Load packages
+pacman::p_load(tidyverse, readxl, stringr, lubridate, googlesheets, rvest, forcats, 
+               grid, gridExtra, htmlTable, highcharter)
+
+# Token to connect to Googlespreadsheets
+#token <- gs_auth(cache = FALSE)
+#saveRDS(token, file = "googlesheets_token.rds")
+suppressMessages(gs_auth(token = "googlesheets_token.rds", verbose = FALSE))
+
+# Create corresponding folders in working directory
+data_path <- "data/"; viz_path <- "viz/"
+
+#Set ggplot theme
+ggplot2::theme_set(theme_minimal() + 
+                     theme(legend.position="top", plot.caption = element_text(size = 8), 
+                           panel.grid.minor.x = element_blank(), 
+                           strip.background = element_rect(fill = "grey85", colour = "grey85"),
+                           legend.margin=margin(t = -0.3, r = 0, b = -0.4, l=0, unit="cm")))
+
+wharton_col <- c("#004785", "#A90533", "#A262460", "#282F85", "#026CB5", "#06AAFC",
+                 "#532A85","#96227D", "#A8204E","#C5093B","#2D2C41","#D7BC6A",
+                 "#B2B6A7","EEEDEA")
+names(wharton_col) <- c("wharton_blue", 'wharton_red','midnight_blue','atlantic_blue','pacific_blue','bay_blue',
+                        'evening_red','sunset_red','brick_red','heritage_red','night_street','morning_yellow',
+                        'college_grey','marine_grey')
+
+hcoptslang <- getOption("highcharter.lang")
+hcoptslang$thousandsSep <- ","
+hcoptslang$numericSymbols <- c("k", "M", "B", "T", "P", "E")
+options(highcharter.lang = hcoptslang)
+```
+
+## Summary
+
+1. This notebook documents how we built the [Google Sheet](https://docs.google.com/spreadsheets/d/18PgeLV0QIaRghlBXfa_LXyYXMVbHqY2AqyaTB4teZm0/edit?usp=sharing) with course and instructor evaluations and clearing prices
+2. There are some basic exploratory plots at the end
+
+# Data Acquisition
+
+## CourseMatch Sections
+
+To get all sections listed in CourseMatch, we extract the table from the html. First, save the home CourseMatch interface page as a .html file in the data folder. Some courses are cross-listed and we create a column to include the other sections a course can be listed as. 
+
+```{r parse-coursematch-html}
+# List of sections available for selection within CourseMatch
+coursematch_sections <- 
+  read_html(paste0(data_path, "Course Match.html")) %>%
+  html_node(xpath = '//*[@id="preferences-table"]') %>%
+  html_table(header = TRUE, trim = TRUE) %>%
+  as_tibble() %>%
+  select(1) %>%
+  rename_at(vars(contains("Dept")), funs(paste0("Course_Multiple"))) %>%
+  mutate(Section = str_extract_all(Course_Multiple, "[A-Z]{4}[0-9]{6}")) %>%
+  unnest() %>%
+  mutate(cross_listed_as = str_replace(Course_Multiple, Section, "")) %>%
+  mutate(cross_listed_as = if_else(cross_listed_as == "", NA_character_, cross_listed_as)) %>%
+  distinct(Section, cross_listed_as) %>%
+  rowwise() %>%
+  mutate(cross_listed_as = if_else(cross_listed_as == "", NA_character_, 
+                                   paste0(str_extract_all(cross_listed_as, 
+                                                          "[A-Z]{4}[0-9]{6}", simplify = TRUE), collapse = ","))) %>%
+  ungroup()
+```
+
+
+## Course Information
+
+To get all the information about the Fall 2017 courses, we can use the *export* feature on [Spike](https://spike.wharton.upenn.edu/courses/index.cfm?method=search_courses). Unfortunately, this contains non-MBA classes too (ungrad and PhD).
+
+```{r load-all-wharton-courses}
+spring_2019_courses <- 
+  readxl::read_excel(paste0(data_path, "export_courses.xls"))
+```
+
+
+## Course Evaluations
+
+Course evaluation comes from a [Spike export](https://spike.wharton.upenn.edu/courses/?method=export_evaluations). You need to open the Excel file and resave before it will load into R (see documented issue caused by the way this file was built by Spike). 
+
+```{r load-course-eval-data}
+course_eval <- 
+  readxl::read_excel(paste0(data_path, "CourseEvaluationData.xls"), skip = 1) %>% 
+  filter(n() != row_number())
+```
+
+
+## Clearing Prices
+
+Clearing price data comes the **public** [MBA Inside website](https://mba-inside.wharton.upenn.edu/course-match/). We save the files corresponding to the last 4 semesters, from Spring 2017 to Fall 2018
+
+```{r download-clearing-prices}
+
+# Function to load each xlsx file of clearing prices
+# Need to have a switch because the Fall 2013 file
+# contains an extra row at the top
+fn_load_clearing_price_xlsx <- function(file_name) {
+  if (str_detect(file_name, "13")) {
+    readxl::read_excel(file_name, skip = 1)
+  } else {
+    readxl::read_excel(file_name, skip = 0)
+  }
+}
+
+# Function to rename the columns that 
+# look like 'section' and 'price' to Section
+# and Price so that they can be binded
+fn_rename_at <- function(df, string) {
+  df %>%
+    rename_at(vars(matches(string)), funs(paste0(string)))
+}
+
+# Load and coalesce each of the clearing price
+# Excel files
+clearing_prices <- 
+  list.files(paste0(data_path, "clearing_prices/"), full.names = TRUE) %>%
+  map(fn_load_clearing_price_xlsx) %>%
+  map(select, matches("Section|Price")) %>%
+  map(fn_rename_at, string = "Section") %>%
+  map(fn_rename_at, string = "Price") %>%
+  bind_rows() %>%
+  mutate(Course = str_sub(Section, 1, 7)) %>%
+  select(Course, Section, Price)
+```
+
+# Data Cleaning
+
+After acquiring data from the four data sources we need to do some combining and cleaning.
+
+```{r spring_2019}
+spring_2019 <- 
+  spring_2019_courses %>%
+  select(-Max, -Status) %>%
+  distinct() %>%
+  mutate(Section = strsplit(as.character(Section), " / ")) %>% 
+  unnest(Section) %>%
+  select(Section, everything()) %>%
+  inner_join(coursematch_sections, by = "Section") %>%
+  mutate(title_length = length(Title)) %>%
+  arrange(Section, desc(title_length)) %>%
+  group_by(Section) %>%
+  filter(row_number() == 1) %>%
+  ungroup() %>%
+  mutate(
+    Course = str_sub(Section, 1, 7)
+    , Section = str_sub(Section, 8, 10)
+    , CU = as.numeric(CU)
+  ) %>%
+  select(Course, Section, Title, Instructor, CU, Dates, `Day(s)`, cross_listed_as) %>%
+  separate(Dates, c("start_date", "end_date"), sep = "-") %>%
+  mutate(
+    start_date = lubridate::mdy(start_date)
+    , Days = stringr::str_extract(`Day(s)`, "^([\\w]+)")
+    , Quarter = if_else(CU == 1, "Full", if_else(lubridate::month(start_date) == 8, "Q1", "Q2"))
+    , start_time = stringr::str_extract(`Day(s)`, "(?:\\S+){2}(\\S+)")
+    , end_time = str_trim(stringr::str_extract(`Day(s)`, "\\s(\\S+)$"))
+    , Title = str_to_title(Title)
+  ) %>%
+  select(-start_date, -end_date, -`Day(s)`)
+```
+
+```{r tbl_questions}
+tbl_questions <- tribble(
+  ~question_type, ~question, ~question_abbr
+  , 'Course', 'Overall Quality of Course (0=worst 4=best)', 'Course Quality'
+  , 'Course', 'Value of Assigned Readings (0=worst 4=best)', 'Value of Assigned Readings'
+  , 'Course', 'Learned from this Course in terms of Knowledge / Concepts / Skills / Thinking Ability (0=worst 4=best)', 'Amount Learned'
+  , 'Course', 'Rate the Difficulty of this Course (0=easiest 4=hardest)', 'Difficulty'
+  , 'Course', 'Rate the Amount of Work Required for this Course (0=easiest 4=hardest)', 'Amount of Work Required'
+  , 'Course', 'Would you Recommend this Course to a Major? (4=most strongly)', 'Recommend to Major?'
+  , 'Course', 'Would you Recommend this Course to a Non-Major? (4=most strongly)', 'Recommend to Non-Major'
+  , 'Instructor', 'Overall Quality of Instructor (0=worst 4=best)', 'Instructor Quality'
+  , 'Instructor', 'Instructor Ability to Communicate Subject Matter (0=worst 4=best)', 'Ability to Communicate Subject Matter'
+  , 'Instructor',  'Instructor Ability to Stimulate Student Interest (0=worst 4=best)', 'Ability to Stimulate Interest'
+  , 'Instructor', 'Instructor Accessibility / Willingness to Discuss Course Content / Problems (0=worst 4=best)', 'Instructor Accessibility'  
+) %>%
+  mutate(
+    question_type = fct_inorder(question_type)
+    , question_abbr = fct_inorder(question_abbr)
+  )
+```
+
+```{r tbl_course_lookup}
+tbl_course_lookup <-
+  tribble(
+    ~evaluated_course, ~coursematch_course,
+    'ACCT208',	'ACCT718',
+    'BEPP201',	'BEPP770',
+    'BEPP305',	'BEPP805',
+    'STAT451',	'BEPP851',
+    'STAT453',	'BEPP853',
+    #'REAL721',	'FNCE721',
+    #'OIDD693',	'LGST693',
+    #'LGST809',	'MGMT815',
+    'OIDD415',	'OIDD515',
+    'STAT470',	'STAT770',
+    'STAT451',	'STAT851',
+    'STAT453',	'STAT853',
+    NA_character_, 'MGMT833',
+    NA_character_, 'LGST641',
+    'OIDD691', 'MGMT691', 
+    'LGST806', 'MGMT691',
+    'BEPP289', 'BEPP789',
+    'OIDD261', 'BEPP761',
+    'LGST202', 'LGST802',
+    'LGST220', 'LGST820',
+    'LGST215', 'LGST815',
+    'MKTG224', 'MKTG724',
+    'OIDD397', 'OIDD697',
+    'OIDD261', 'OIDD761',
+    'REAL215', 'REAL724',
+    'MKTG212', 'MKTG712'
+  )
+```
+
+```{r cross_listed_course}
+cross_listed_course <- 
+  tribble(
+    ~coursematch, ~evaluated_as
+      , "BEPP708", "REAL708" # Housing Markets
+      , "OIDD763", "BEPP763" # Energy Markets and Policy
+      , "FNCE721", "REAL721" # Real Estate Investments
+      , "LGST692", "OIDD692" # Advanced Topics in Negotiations
+      , "LGST804", "REAL804" # Real Estate Law
+      , "LGST806", "MGMT691" # Negotiations 
+      , "MGMT815", "LGST809" # Sports Business Mgmt
+      , "MGMT692", "OIDD692" # Advanced Topics in Negotiations        
+      , "STAT776", "MKTG776" # Applied Probablistic Models in Marketing
+      , "OIDD691", "MGMT691" # Negotiations 
+      , "MGMT690", "OIDD690" # Managerial Decisn Making
+      , "LGST693", "OIDD693" # Influence
+  )
+```
+
+```{r course_eval_cleaned}
+course_eval_cleaned <- 
+  course_eval %>%
+  gather(question, value, -Term, -Section, -Title, -Instructor) %>%
+  left_join(tbl_questions, by = 'question') %>%
+  select(-question) %>%
+  mutate(
+    Year = str_sub(Term, 1,4)
+    , Course = str_sub(Section, 1, 7)
+  ) %>%
+  left_join(tbl_course_lookup, by = c('Course' = 'evaluated_course')) %>%
+  mutate(Course = if_else(is.na(coursematch_course), Course, coursematch_course)) %>%
+  mutate(
+    Course_Num = str_sub(Course, 5, 7)
+    , Dept = str_sub(Course, 1, 4)
+  ) %>%
+  select(Year, Dept, Course_Num, Course, Section, Title, Instructor, question_type, question_abbr, value) %>%
+  # OIDD515 (Product Design) is the only CourseMatch class with a course number less than 600
+  filter(Course == "OIDD515" | (Course_Num >= 600 & Course_Num < 900))   
+```
+
+```{r show_course_eval_cleaned, echo = FALSE}
+course_eval_cleaned %>% 
+  sample_n(10) %>% 
+  htmlTable(
+    rnames = FALSE
+    , caption = "10 sample rows from the tidied course evaluation data"
+    , css.cell = "padding-left: .5em; padding-right: .5em;"
+    , header = c('Year','Dept','Course Number','Course','Section','Title','Instructor','Question Type', 'Question', "Value")
+    , align = c("cccccllclr")
+    , col.rgroup = c("none", "#F7F7F7")
+  )
+```
+
+# Summaries for Google Sheet
+
+We present that data at two levels of detail:
+
+1. **Course View**: Aggregate the reviews for all sections a course was taught
+2. **Instructor View**: Aggregate the reviews for all sections an instructor has taught
+
+We also create a "benchmark" that uses all historical data (not just the courses that will be taught in Spring 2019).
+
+## Course View
+
+```{r course_metrics}
+course_metrics <- 
+  spring_2019 %>%
+  left_join(cross_listed_course, by = c('Course' = 'coursematch')) %>% 
+  mutate(evaluated_as = if_else(is.na(evaluated_as), Course, evaluated_as)) %>%
+  left_join(
+    course_eval_cleaned %>%
+      filter(question_type == "Course") %>%
+      group_by(Course, question_abbr) %>%
+      summarise(
+        value = mean(value)
+        , sections_evaluated = n()
+      ) %>%
+      spread(question_abbr, value)
+    , by = c('evaluated_as' = 'Course')
+  ) %>%
+  left_join(
+    clearing_prices %>%
+      filter(str_sub(Course, 1, 4) != "WHCP") %>%
+      mutate(Course = str_replace(Course, "OPIM", "OIDD")) %>%
+      left_join(cross_listed_course, by = c('Course' = 'coursematch')) %>%
+      mutate(evaluated_as = if_else(is.na(evaluated_as), Course, evaluated_as)) %>%
+      group_by(evaluated_as) %>%
+      summarise(clearing_price = mean(Price)) %>%
+      ungroup() %>%
+      mutate(percentile = percent_rank(clearing_price))
+    , by = c("evaluated_as")
+  ) %>%
+  select(-evaluated_as) %>%
+  select(-one_of('cross_listed_as'), one_of('cross_listed_as'))
+```
+
+```{r course_benchmark}
+course_benchmark <- 
+  course_eval_cleaned %>%
+  filter(question_type == "Course") %>%
+  group_by(question_abbr) %>%
+  summarise(
+    value = mean(value)
+    , sections_evaluated = n()
+  ) %>%
+  spread(question_abbr, value) %>%
+  bind_cols(
+    clearing_prices %>%
+      filter(str_sub(Course, 1, 4) != "WHCP") %>%
+      summarise(clearing_price = mean(Price))
+  )
+```
+
+## Instructor View
+
+```{r instructor_metrics}
+instructor_metrics <- 
+  spring_2019 %>%
+  mutate(instructors = strsplit(Instructor, "/")) %>% 
+  unnest(instructors) %>%
+  mutate(instructors = str_trim(instructors)) %>%
+  filter(!(is.na(instructors) | instructors == "")) %>%
+  distinct(instructors) %>%
+  left_join(
+    course_eval_cleaned %>%
+      filter(question_type == "Instructor") %>%
+      group_by(Instructor, question_abbr) %>%
+      summarise(
+        value = mean(value)
+        , sections_evaluated = n()
+      ) %>%
+      spread(question_abbr, value)
+    , by = c('instructors' = 'Instructor')
+  ) %>%
+  arrange(instructors)
+```
+
+```{r instructor_benchmark}
+instructor_benchmark <- 
+  course_eval_cleaned %>%
+  filter(question_type == "Instructor") %>%
+  group_by(question_abbr) %>%
+  summarise(
+    value = mean(value)
+    , sections_evaluated = n()
+  ) %>%
+  spread(question_abbr, value)
+```
+
+## Export to Google Sheet
+
+We then use the [googlesheets](https://cran.r-project.org/web/packages/googlesheets/) package to add them to the [Google Sheet](https://docs.google.com/spreadsheets/d/18PgeLV0QIaRghlBXfa_LXyYXMVbHqY2AqyaTB4teZm0/edit?usp=sharing)
+
+
+```{r update_google_sheet}
+if (params$external_queries) {
+  gs <- gs_title("Analytics Club - CourseMatch Spring 2019 (File --> Make a copy)")
+    
+  # Course View tab
+  gs %>% gs_edit_cells(ws = "Course View", input = course_benchmark, anchor = "K3", col_names = FALSE)
+  gs %>% gs_edit_cells(ws = "Course View", input = course_metrics, anchor = "B4", col_names = FALSE)
+    
+  # Instructor View tab
+  gs %>% gs_edit_cells(ws = "Instructor View", input = instructor_benchmark, anchor = "C3", col_names = FALSE)
+  gs %>% gs_edit_cells(ws = "Instructor View", input = instructor_metrics, anchor = "B4", col_names = FALSE)
+}
+```
