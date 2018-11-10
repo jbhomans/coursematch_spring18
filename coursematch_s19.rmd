@@ -181,7 +181,7 @@ spring_2019 <-
   mutate(
     start_date = lubridate::mdy(start_date)
     , Days = stringr::str_extract(`Day(s)`, "^([\\w]+)")
-    , Quarter = if_else(CU == 1, "Full", if_else(lubridate::month(start_date) == 8, "Q1", "Q2"))
+    , Quarter = if_else(CU == 1, "Full", if_else(lubridate::month(start_date) == 1, "Q1", "Q2"))
     , start_time = stringr::str_extract(`Day(s)`, "(?:\\S+){2}(\\S+)")
     , end_time = str_trim(stringr::str_extract(`Day(s)`, "\\s(\\S+)$"))
     , Title = str_to_title(Title)
